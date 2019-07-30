@@ -5,7 +5,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Resource;
 import org.apache.commons.lang3.StringUtils;
@@ -26,17 +25,17 @@ import org.apache.spark.streaming.kafka.HasOffsetRanges;
 import org.apache.spark.streaming.kafka.KafkaUtils;
 import org.apache.spark.streaming.kafka.OffsetRange;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import com.google.common.collect.Sets;
+import com.sjj.rdd.function.Accumulator;
+import com.sjj.rdd.function.DStream2Row;
+import com.sjj.rdd.function.Line2Word;
+import com.sjj.rdd.function.MessageAndMeta;
+import com.sjj.rdd.function.TupleValue;
+import com.sjj.rdd.function.WordTick;
 import com.sjj.service.IOperateHiveWithSpark;
-import com.sjj.util.Accumulator;
-import com.sjj.util.DStream2Row;
-import com.sjj.util.Line2Word;
-import com.sjj.util.MessageAndMeta;
-import com.sjj.util.TupleValue;
-import com.sjj.util.WordTick;
+import com.sjj.util.RedisUtil;
 
 import kafka.common.TopicAndPartition;
 import kafka.serializer.StringDecoder;
@@ -46,15 +45,13 @@ import org.apache.spark.streaming.Durations;
 
 /**
  * spark streaming监听kafka消息，实现统计消息中单词出现次数，最后写入hive表
+ * 
  * @author Tim
  *
  */
 @Slf4j
 @Service
 public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
-
-	private static final String KAFKA_PATITION_REDIS_KEY_SUFFIX = ".partition";
-	private static final String KAFKA_OFFSET_REDIS_KEY_SUFFIX = ".offset";
 
 	@Value("${kafka.broker}")
 	private String kafkaBroker;
@@ -70,18 +67,15 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 
 	@Value("${spark.ui.port}")
 	private String sparkUiPort;
-		
+
 	@Value("${hadoop.user}")
 	private String hadoopUser;
-	
+
 	@Value("${hive.db.name}")
 	private String hiveDBName;
 
 	@Resource
-	RedisTemplate<String, String> redisTemplate;
-
-	//
-	Map<TopicAndPartition, Long> offsets = new HashMap<TopicAndPartition, Long>();
+	RedisUtil redisUtil;
 
 	// Hold a reference to the current offset ranges, so it can be used downstream
 	final AtomicReference<OffsetRange[]> offsetRanges = new AtomicReference<>();
@@ -103,7 +97,7 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 
 		// Spark应用的名称，可用于查看任务状态
 		SparkConf sc = new SparkConf().setAppName(sparkAppName);
-		
+
 		// 配置spark UI的端口，默认是4040
 		if (StringUtils.isNumeric(sparkUiPort)) {
 			sc.set("spark.ui.port", sparkUiPort);
@@ -125,7 +119,8 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 		kafkaParams.put("metadata.broker.list", kafkaBroker);
 
 		// 获取消费kafka的offset
-		getOffset(topicsSet);
+		// Hold a reference to the current offset ranges, so it can be used downstream
+		Map<TopicAndPartition, Long> offsets = redisUtil.getOffset(topicsSet);
 
 		JavaDStream<String> messages = null;
 
@@ -184,7 +179,7 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 					log.error(">>>" + rowRDD.partitions().size());
 
 					hiveContext.sql("set hive.exec.stagingdir = /tmp/staging/.hive-staging");
-					hiveContext.sql("use "+hiveDBName);
+					hiveContext.sql("use " + hiveDBName);
 
 					DataFrame df = hiveContext.createDataFrame(rowRDD, schema).coalesce(10);
 
@@ -193,7 +188,7 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 
 					// 更新offset
 					for (OffsetRange offsetRange : offsetRanges.get()) {
-						setOffsetToRedis(offsetRange);
+						redisUtil.setOffset(offsetRange);
 					}
 
 				}
@@ -205,43 +200,5 @@ public final class OperateHiveWithSpark implements IOperateHiveWithSpark {
 		// Start the computation
 		jssc.start();
 		jssc.awaitTermination();
-	}
-
-	@Override
-	public void getOffset(Set<String> topics) {
-		getOffsetFromRedis(topics);
-	}
-
-	@Override
-	public void setOffset(OffsetRange offsetRange) {
-		setOffsetToRedis(offsetRange);
-	}
-
-	private void getOffsetFromRedis(Set<String> topics) {
-		for (String topic : topics) {
-			try {
-				Integer partation = Integer
-						.parseInt(redisTemplate.opsForValue().get(topic + KAFKA_PATITION_REDIS_KEY_SUFFIX));
-				Long offset = Long.parseLong(redisTemplate.opsForValue().get(topic + KAFKA_OFFSET_REDIS_KEY_SUFFIX));
-				if (null != partation && null != offset) {
-					log.info("### get kafka offset in redis for kafka ### " + topic + KAFKA_OFFSET_REDIS_KEY_SUFFIX
-							+ " >>> " + partation + " | " + offset);
-					offsets.put(new TopicAndPartition(topic, partation), offset);
-				}
-			} catch (NumberFormatException e) {
-				log.error("### Topic: " + topic + " offset exception ###");
-			}
-		}
-	}
-
-	private void setOffsetToRedis(OffsetRange offsetRange) {
-		redisTemplate.opsForValue().set(offsetRange.topic() + KAFKA_PATITION_REDIS_KEY_SUFFIX,
-				String.valueOf(offsetRange.partition()));
-		redisTemplate.opsForValue().set(offsetRange.topic() + KAFKA_OFFSET_REDIS_KEY_SUFFIX,
-				String.valueOf(offsetRange.fromOffset()));
-
-		log.info("### update kafka offset in redis ### " + offsetRange.topic() + KAFKA_PATITION_REDIS_KEY_SUFFIX
-				+ " >>> " + offsetRange);
-
 	}
 }
